@@ -1,3 +1,4 @@
+import math
 import os
 import sqlite3
 import sys
@@ -793,6 +794,66 @@ def test_heat_exposure_crossing_barely_inside_extreme_ramp(client):
     assert body["above_seconds"] == 0.0
     # Triangle over the sliver above T: about 9.9584e275 degree-seconds.
     assert body["excess_degree_seconds"] == pytest.approx(9.9584463529e275, rel=1e-10)
+
+
+def test_heat_exposure_narrow_extreme_crossing_over_longer_span(client):
+    # Same extreme ramp as above but with the two readings ten seconds
+    # apart and M=10, queried over the whole span. Multiplying the scale
+    # back into the area before the ~1e-16 crossing fraction overflowed
+    # an intermediate product (scale * 10 is already beyond the float
+    # range) and returned excess_degree_seconds=inf; the true triangle
+    # area is ten times the one-second value and still finite.
+    set_thresholds(client)
+    set_sampling(client, max_interval=10, grace=0)
+    post_readings(
+        client,
+        [("2026-01-01T00:00:00+00:00", -1e308), ("2026-01-01T00:00:10+00:00", 1e308)],
+    )
+    resp = get_heat(
+        client,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:10+00:00",
+        9.999999999999998e307,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 10.0
+    # ~9.98e-16 s above still rounds to 0 at the six-decimal display.
+    assert body["above_seconds"] == 0.0
+    assert math.isfinite(body["excess_degree_seconds"])
+    # Ten seconds of ramp makes the triangle ten times the 1 s value.
+    assert body["excess_degree_seconds"] == pytest.approx(9.9584463529e276, rel=1e-10)
+
+
+def test_heat_exposure_ramp_to_max_finite_float_stays_finite(client):
+    # Whole-second readings -1 -> sys.float_info.max with M=1 and T=0:
+    # the scale derivation ldexp(1, floor(log2(max))) asked for
+    # 2**1024 and raised OverflowError. With the scale taken from
+    # frexp's binary exponent the ramp computes normally: above for
+    # essentially the whole second, with a triangle area of about
+    # max_float / 2 degree-seconds.
+    max_float = sys.float_info.max
+    set_thresholds(client)
+    set_sampling(client, max_interval=1, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", -1.0),
+            ("2026-01-01T00:00:01+00:00", max_float),
+        ],
+    )
+    resp = get_heat(
+        client,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:01+00:00",
+        0.0,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 1.0
+    assert body["above_seconds"] == 1.0
+    assert math.isfinite(body["excess_degree_seconds"])
+    assert body["excess_degree_seconds"] == pytest.approx(max_float / 2, rel=1e-15)
 
 
 def test_heat_exposure_smallest_subnormal_ramp_at_zero_baseline(client):

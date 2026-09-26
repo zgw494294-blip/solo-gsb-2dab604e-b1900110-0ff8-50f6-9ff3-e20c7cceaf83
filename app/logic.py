@@ -330,10 +330,15 @@ def _segment_above(
     that part is the trapezoidal area of (temperature - T).
 
     All temperature arithmetic runs on one common power-of-two scale
-    derived from the largest magnitude involved. Division by a power of
-    two is exact and every scaled value lands in [-2, 2], which fixes
-    both ends of the finite-input range at once:
+    derived from the largest magnitude involved. The scale is the largest
+    power of two not exceeding that magnitude (taken from frexp's binary
+    exponent, which never overflows even for sys.float_info.max itself),
+    division by it is exact and every scaled value lands in [-2, 2), which
+    fixes both ends of the finite-input range at once:
 
+      * the scale never overflows while being chosen, so legitimate extreme
+        readings (e.g. -1 -> sys.float_info.max around T = 0) compute
+        instead of raising OverflowError from a scale as large as 2**1024;
       * the scaled difference can never overflow, so legitimate extreme
         readings (e.g. -1e308 -> 1e308 around a baseline near +1e308)
         keep a finite crossing ratio and area instead of collapsing to
@@ -342,9 +347,14 @@ def _segment_above(
         the smallest positive readings (e.g. 0 -> 5e-324, the minimum
         subnormal, at T = 0) interpolate instead of dividing by zero.
 
-    The scale is folded back in at the end; the result can only become
-    infinite when the true degree-second value itself exceeds the float
-    range.
+    The scale is folded back in by multiplication *last*, after the tiny
+    crossing ratio and the bounded scaled heights have already been
+    multiplied together: multiplying it earlier (before the ~1e-16
+    crossing ratio) overflows intermediate products for a perfectly
+    finite area (e.g. a ten-second -1e308 -> 1e308 ramp crossing
+    T = 9.999999999999998e307, whose true area is ~9.958e276). The
+    result can only become infinite when the true degree-second value
+    itself exceeds the float range.
     """
     total = (t1 - t0).total_seconds()
     above0, above1 = v0 > baseline, v1 > baseline
@@ -353,21 +363,27 @@ def _segment_above(
 
     # Largest of |v0|, |v1|, |T| is strictly positive here: an endpoint
     # strictly above a finite T guarantees a nonzero magnitude somewhere.
-    scale = math.ldexp(
-        1.0, math.floor(math.log2(max(abs(v0), abs(v1), abs(baseline))))
-    )
+    # frexp gives the binary exponent directly: the largest power of two
+    # not exceeding ``largest`` is 2**(exponent - 1). Unlike
+    # ldexp(1, floor(log2(largest))) this never asks for 2**1024, so it
+    # stays finite when largest is sys.float_info.max (log2 of which is
+    # exactly 1024.0).
+    largest = max(abs(v0), abs(v1), abs(baseline))
+    scale = math.ldexp(1.0, math.frexp(largest)[1] - 1)
     w0, w1, wt = v0 / scale, v1 / scale, baseline / scale
     if above0 and above1:
         # Trapezoid 0.5 * ((v0 - T) + (v1 - T)) * total; the differences
         # are taken on the common scale, so they stay finite for any
-        # finite endpoints.
-        return total, 0.5 * total * scale * ((w0 - wt) + (w1 - wt))
+        # finite endpoints, and scale is multiplied back in last so a
+        # finite trapezoid cannot overflow on an intermediate product.
+        return total, 0.5 * total * ((w0 - wt) + (w1 - wt)) * scale
 
     # Exactly one endpoint above T: split at the (unique) crossing point.
     # above_w is the scaled excess of the above endpoint, below_w the
     # scaled depth of the other; the crossing fraction is excess over
     # the whole span. The above part is a triangle in (temperature - T):
-    # area 0.5 * excess * above_time, all evaluated on the common scale.
+    # area 0.5 * excess * above_time, all evaluated on the common scale
+    # with scale folded back in last.
     if above0:
         above_w = w0 - wt
         below_w = wt - w1
@@ -377,7 +393,7 @@ def _segment_above(
     denom = above_w + below_w
     above_ratio = above_w / denom
     above_time = total * above_ratio
-    excess = 0.5 * total * scale * above_w * above_ratio
+    excess = 0.5 * total * above_w * above_ratio * scale
     return above_time, excess
 
 
@@ -413,11 +429,19 @@ def compute_heat_exposure(
     such as -1e308 -> 1e308), which used to turn the results into NaN.
     The convex form stays finite for any finite endpoint temperatures.
     The crossing ratio and the (temperature - T) area are likewise taken
-    on one common power-of-two scale rather than as raw differences or
-    ``1 - ratio``: this keeps them finite for endpoint differences near
-    the float range (no cancellation of a tiny crossing fraction) and
-    nonzero for the smallest subnormal readings (no underflow to a zero
-    denominator).
+    on one common power-of-two scale — the largest power of two not
+    exceeding the largest magnitude of the two endpoints and T, taken
+    from frexp's binary exponent so that choosing the scale cannot
+    overflow even for sys.float_info.max — rather than as raw
+    differences or ``1 - ratio``: this keeps them finite for endpoint
+    differences near the float range (no cancellation of a tiny
+    crossing fraction) and nonzero for the smallest subnormal readings
+    (no underflow to a zero denominator). The scale is multiplied back
+    into the area only *after* the bounded scaled height and the
+    crossing fraction, so a narrow crossing above a huge baseline keeps
+    its finite area over any window length instead of overflowing an
+    intermediate product; the area is infinite only when the true
+    integral itself exceeds the float range.
 
     Pure function of current data: corrections, late arrivals and M
     changes simply change the inputs, so the next query sees them.
