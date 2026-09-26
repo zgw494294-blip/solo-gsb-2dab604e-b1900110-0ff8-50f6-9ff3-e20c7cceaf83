@@ -342,9 +342,21 @@ def _segment_above(
         the smallest positive readings (e.g. 0 -> 5e-324, the minimum
         subnormal, at T = 0) interpolate instead of dividing by zero.
 
-    The scale is folded back in at the end; the result can only become
-    infinite when the true degree-second value itself exceeds the float
-    range.
+    The scale itself is taken from ``frexp`` rather than
+    ``ldexp(1, floor(log2(x)))``: ``log2`` of the largest finite float
+    rounds up to 1024, and ``ldexp(1.0, 1024)`` overflows
+    (OverflowError) before any arithmetic happens. ``frexp`` yields the
+    same leading power of two without ever forming 2**1024.
+
+    The scale is folded back in as the very last multiplication, after
+    every sub-unity factor (the 0.5 triangle factor, the small scaled
+    excess, the crossing ratio). Restoring it earlier overflows to inf
+    even when the finished product is finite and small: a ten-second
+    segment from -1e308 to 1e308 crossing a baseline near 1e308 spends
+    only ~1e-15 seconds above T and its true area is ~1e277, yet
+    ``0.5 * total * scale`` alone already overflows. The result can only
+    become infinite when the true degree-second value itself exceeds the
+    float range.
     """
     total = (t1 - t0).total_seconds()
     above0, above1 = v0 > baseline, v1 > baseline
@@ -353,15 +365,18 @@ def _segment_above(
 
     # Largest of |v0|, |v1|, |T| is strictly positive here: an endpoint
     # strictly above a finite T guarantees a nonzero magnitude somewhere.
-    scale = math.ldexp(
-        1.0, math.floor(math.log2(max(abs(v0), abs(v1), abs(baseline))))
-    )
+    # frexp(m) = (f, e) with 0.5 <= |f| < 1, so 2**(e - 1) is the largest
+    # power of two not exceeding m — reached without log2 rounding to the
+    # next binade and without forming the non-finite 2**1024.
+    _, exponent = math.frexp(max(abs(v0), abs(v1), abs(baseline)))
+    scale = math.ldexp(1.0, exponent - 1)
     w0, w1, wt = v0 / scale, v1 / scale, baseline / scale
     if above0 and above1:
         # Trapezoid 0.5 * ((v0 - T) + (v1 - T)) * total; the differences
         # are taken on the common scale, so they stay finite for any
-        # finite endpoints.
-        return total, 0.5 * total * scale * ((w0 - wt) + (w1 - wt))
+        # finite endpoints, and scale is restored last so an intermediate
+        # product can only overflow when the true area exceeds float range.
+        return total, 0.5 * total * ((w0 - wt) + (w1 - wt)) * scale
 
     # Exactly one endpoint above T: split at the (unique) crossing point.
     # above_w is the scaled excess of the above endpoint, below_w the
@@ -377,7 +392,11 @@ def _segment_above(
     denom = above_w + below_w
     above_ratio = above_w / denom
     above_time = total * above_ratio
-    excess = 0.5 * total * scale * above_w * above_ratio
+    # Scale restored last: every preceding factor is bounded (0.5, the
+    # scaled excess <= 2, and the crossing time), so this is finite for
+    # any finite true area, including a ~1e-15 s above-T sliver off a
+    # ~1e308 swing.
+    excess = 0.5 * above_w * above_time * scale
     return above_time, excess
 
 
@@ -417,7 +436,12 @@ def compute_heat_exposure(
     ``1 - ratio``: this keeps them finite for endpoint differences near
     the float range (no cancellation of a tiny crossing fraction) and
     nonzero for the smallest subnormal readings (no underflow to a zero
-    denominator).
+    denominator). The scale is derived with ``frexp`` (``log2`` rounds up
+    to 1024 at the largest finite float and would make ``ldexp`` raise
+    OverflowError) and folded back into the area only as the last
+    multiplication, so a ~1e-15 s above-T sliver off a ~1e308 swing keeps
+    its finite ~1e277 area instead of overflowing through an early
+    ``0.5 * duration * scale`` product.
 
     Pure function of current data: corrections, late arrivals and M
     changes simply change the inputs, so the next query sees them.

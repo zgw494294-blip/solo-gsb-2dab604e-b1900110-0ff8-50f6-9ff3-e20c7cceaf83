@@ -1,3 +1,4 @@
+import math
 import os
 import sqlite3
 import sys
@@ -817,6 +818,85 @@ def test_heat_exposure_smallest_subnormal_ramp_at_zero_baseline(client):
     assert body["covered_seconds"] == 1.0
     assert body["above_seconds"] == 1.0
     assert body["excess_degree_seconds"] == 0.0
+
+
+def test_heat_exposure_ten_second_extreme_swing_keeps_sliver_area_finite(client):
+    # -1e308 -> 1e308 over ten seconds (M=10s), baseline T so close to the
+    # top endpoint that only ~1e-15 s sits above T. The old scale restore
+    # multiplied ``0.5 * total * scale`` before the tiny crossing factors
+    # and overflowed to inf even though the true area is ~9.9584e276.
+    set_thresholds(client)
+    set_sampling(client, max_interval=10, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", -1e308),
+            ("2026-01-01T00:00:10+00:00", 1e308),
+        ],
+    )
+    resp = get_heat(
+        client,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:10+00:00",
+        9.999999999999998e307,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 10.0
+    assert body["above_seconds"] == 0.0  # ~9.98e-16 s rounds away at six decimals
+    assert body["excess_degree_seconds"] == pytest.approx(9.9584463529e276, rel=1e-10)
+    assert math.isfinite(body["excess_degree_seconds"])
+
+
+def test_heat_exposure_ramp_to_largest_finite_float_returns_half(client):
+    # -1 -> sys.float_info.max over one second (M=1s), T=0. The old scale
+    # used ldexp(1, floor(log2(max_float))); log2 rounds up to 1024 and
+    # ldexp(1.0, 1024) raised OverflowError. The triangle above T is
+    # essentially half of the largest finite float.
+    set_thresholds(client)
+    set_sampling(client, max_interval=1, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", -1.0),
+            ("2026-01-01T00:00:01+00:00", sys.float_info.max),
+        ],
+    )
+    resp = get_heat(
+        client,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:01+00:00",
+        0.0,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["covered_seconds"] == 1.0
+    assert body["above_seconds"] == 1.0
+    assert body["excess_degree_seconds"] == pytest.approx(sys.float_info.max / 2)
+    assert math.isfinite(body["excess_degree_seconds"])
+
+
+def test_heat_exposure_area_beyond_float_range_is_infinite(client):
+    # A sustained temperature at the largest finite float over a real span
+    # has a true degree-second area beyond float range: inf is then the
+    # correct answer, not an artifact of the scale arithmetic.
+    set_thresholds(client)
+    set_sampling(client, max_interval=60, grace=0)
+    post_readings(
+        client,
+        [
+            ("2026-01-01T00:00:00+00:00", sys.float_info.max),
+            ("2026-01-01T00:01:00+00:00", sys.float_info.max),
+        ],
+    )
+    body = get_heat(
+        client,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:01:00+00:00",
+        0.0,
+    ).json()
+    assert body["covered_seconds"] == 60.0
+    assert body["excess_degree_seconds"] == float("inf")
 
 
 # ------------------------------------------------------------ freshness & UTC

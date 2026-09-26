@@ -1380,12 +1380,16 @@ def heat_exposure(
     extrapolated. Segments are clipped to [start, end] (a window boundary
     may be interpolated from the readings on either side of it) and split
     wherever the temperature crosses T. The crossing fraction and the
-    (temperature - T) area are evaluated on one common power-of-two
-    scale, so legitimate finite extremes never overflow and the smallest
-    positive readings never underflow the crossing division: a sliver of
-    above-T time keeps its (huge) degree-second area even when the
-    rounded above_seconds display is 0, and 0 -> 5e-324 at T = 0 reports
-    full coverage with an area that rounds to 0. All time math is done
+    (temperature - T) area are evaluated on one common power-of-two scale
+    (derived with frexp and restored into the area only last), so
+    legitimate finite extremes never overflow — not even
+    -1 -> sys.float_info.max, where an ldexp(1, floor(log2(...))) scale
+    used to raise OverflowError — and the smallest positive readings
+    never underflow the crossing division: a sliver of above-T time keeps
+    its (huge) degree-second area even when the rounded above_seconds
+    display is 0, and 0 -> 5e-324 at T = 0 reports full coverage with an
+    area that rounds to 0. The area is infinite only when the true
+    integral exceeds the float range. All time math is done
     in UTC, and the result is always recomputed from the current
     readings and M, so late arrivals, corrections and M changes take
     effect immediately. A device without a sampling config returns 409.
